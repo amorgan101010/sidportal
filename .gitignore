@@ -1,0 +1,11 @@
+# Firmware, patch banks, builds and generated output never belong in this repository.
+/build/
+/build-*/
+/roms/
+/patches/
+__pycache__/
+*.pyc
+*.bin
+*.syx
+*.zip
+*.wav
