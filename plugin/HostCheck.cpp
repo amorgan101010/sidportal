@@ -11,6 +11,7 @@ int main(int argc, char** argv)
 {
     juce::ScopedJuceInitialiser_GUI init;
     if (argc < 2) { std::puts("usage: HostCheck PATH.vst3"); return 2; }
+    const bool loadOnly = argc > 2 && juce::String(argv[2]) == "--load-only";
     juce::VST3PluginFormat format;
     juce::OwnedArray<juce::PluginDescription> found;
     format.findAllTypesForFile(found, argv[1]);
@@ -25,6 +26,15 @@ int main(int argc, char** argv)
     plugin->enableAllBuses();
     plugin->setPlayConfigDetails(plugin->getTotalNumInputChannels(), 2, 48000.0, 512);
     plugin->prepareToPlay(48000.0, 512);
+    if (loadOnly) {
+        juce::AudioBuffer<float> probe(std::max(2, plugin->getTotalNumInputChannels()), 512);
+        juce::MidiBuffer midi;
+        probe.clear();
+        plugin->processBlock(probe, midi);
+        plugin->releaseResources();
+        std::puts("ok   VST3 instance prepared and processed an audio block");
+        return 0;
+    }
     juce::AudioBuffer<float> buf(std::max(2, plugin->getTotalNumInputChannels()), 512);
     double peak = 0;
     int midi_out = 0;

@@ -11,15 +11,24 @@ using sidportal::SidEngineType;
 
 namespace {
 
-enum EventKind : uint32_t { KeyDown = 1, KeyUp = 2, Encoder = 3 };
+enum EventKind : uint32_t { KeyDown = 1, KeyUp = 2, Encoder = 3, ResetFirmware = 4 };
 
 juce::File data_dir()
 {
+    if (const char* override_dir = std::getenv("SIDPORTAL_DATA_DIR"))
+        if (*override_dir) return juce::File(override_dir);
+#if JUCE_MAC
+    return juce::File::getSpecialLocation(juce::File::userHomeDirectory)
+        .getChildFile("Library/Application Support/SidPortal");
+#elif JUCE_WINDOWS
+    return juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
+        .getChildFile("SidPortal");
+#else
     const char* xdg = std::getenv("XDG_DATA_HOME");
-    juce::File base = (xdg && *xdg) ? juce::File(xdg)
-                                    : juce::File::getSpecialLocation(juce::File::userHomeDirectory)
-                                          .getChildFile(".local/share");
-    return base.getChildFile("sidportal");
+    if (xdg && *xdg) return juce::File(xdg).getChildFile("sidportal");
+    return juce::File::getSpecialLocation(juce::File::userHomeDirectory)
+        .getChildFile(".local/share/sidportal");
+#endif
 }
 
 // The firmware is never compiled in: the plugin looks where the standalone keeps it.
@@ -43,6 +52,10 @@ std::vector<uint8_t> read_file(const juce::File& f)
 // The factory bank, if the user has put one in patches/ (any .syx with "Presets" in its name).
 juce::File presets_file()
 {
+    if (const char* env = std::getenv("SIDPORTAL_PRESETS")) {
+        juce::File override(env);
+        if (override.existsAsFile()) return override;
+    }
     auto found = juce::File(juce::String(SIDPORTAL_SOURCE_DIR) + "/patches")
                      .findChildFiles(juce::File::findFiles, false, "*Presets*.syx");
     found.sort();
@@ -63,6 +76,10 @@ juce::AudioProcessorValueTreeState::ParameterLayout SidPortalProcessor::layout()
     l.add(std::make_unique<juce::AudioParameterFloat>(juce::ParameterID{"character", 1}, "Filter character",
                                                        juce::NormalisableRange<float>(-0.5f, 0.5f), 0.0f));
     l.add(std::make_unique<juce::AudioParameterBool>(juce::ParameterID{"chip8580", 1}, "SID 8580", false));
+    l.add(std::make_unique<juce::AudioParameterBool>(juce::ParameterID{"noiseGate", 1}, "Noise gate", false));
+    l.add(std::make_unique<juce::AudioParameterFloat>(juce::ParameterID{"gateThresholdDb", 1},
+        "Noise gate threshold", juce::NormalisableRange<float>(-90.0f, -18.0f, 0.1f), -60.0f,
+        juce::AudioParameterFloatAttributes().withLabel("dBFS")));
     return l;
 }
 
@@ -76,6 +93,8 @@ SidPortalProcessor::SidPortalProcessor()
     volume_ = params.getParameter("volume");
     character_ = params.getParameter("character");
     chip_ = params.getParameter("chip8580");
+    gate_enabled_ = params.getParameter("noiseGate");
+    gate_threshold_ = params.getParameter("gateThresholdDb");
     rom_path_ = find_rom();
     // A fresh instance starts from the standalone's memory if there is one, else from a
     // cleared unit that gets the factory bank once it has booted.
@@ -110,7 +129,7 @@ void SidPortalProcessor::boot(int gen, std::vector<uint8_t> ram, bool send_prese
 {
     if (rom_path_.isEmpty()) {
         std::lock_guard<std::mutex> g(problem_mutex_);
-        problem_ = "Firmware not found: run tools/roms.py";
+        problem_ = "Firmware not found: set SIDPORTAL_ROM";
         return;
     }
     const double rate = rate_.load();
@@ -169,6 +188,7 @@ void SidPortalProcessor::boot(int gen, std::vector<uint8_t> ram, bool send_prese
 void SidPortalProcessor::prepareToPlay(double sampleRate, int)
 {
     rate_ = sampleRate;
+    noise_gate_.set_sample_rate(sampleRate);
     std::lock_guard<std::mutex> g(board_mutex_);
     if (board_) board_->set_sample_rate(sampleRate);
 }
@@ -244,7 +264,7 @@ void SidPortalProcessor::render(Board& board, juce::AudioBuffer<float>& buffer, 
         for (int k = 0; k < n; ++k) {
             // Fade in as the board comes up; 6 dB of headroom as in the standalone.
             float fade = std::min(1.0f, float(fade_++) / fade_len);
-            float s = float(pcm[k]) * (vol * 0.5f / 32768.0f) * fade;
+            float s = noise_gate_.process(float(pcm[k]) / 32768.0f) * (vol * 0.5f) * fade;
             for (int ch = 0; ch < getTotalNumOutputChannels(); ++ch) buffer.setSample(ch, pos + k, s);
         }
         pos += n;
@@ -280,7 +300,8 @@ void SidPortalProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mi
         for (uint32_t ev : events_) {
             const uint32_t kind = ev >> 24;
             const int value = int(int32_t(ev << 8) >> 8);   // sign-extend the low 24 bits
-            if (kind == KeyDown) board.key_down(value);
+            if (kind == ResetFirmware) board.reset();
+            else if (kind == KeyDown) board.key_down(value);
             else if (kind == KeyUp) board.key_up(value);
             else if (kind == Encoder) board.encoder(value);
         }
@@ -289,6 +310,8 @@ void SidPortalProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::Mi
         midi_from_editor_.clear();
     }
     apply_params(board, false);
+    noise_gate_.set_threshold_db(gate_threshold_->convertFrom0to1(gate_threshold_->getValue()));
+    noise_gate_.set_enabled(gate_enabled_->getValue() > 0.5f);
 
     juce::MidiBuffer out;
     int pos = 0;
@@ -332,10 +355,68 @@ void SidPortalProcessor::encoder(int steps)
     if (events_.size() < 1024) events_.push_back(Encoder << 24 | (uint32_t(steps) & 0xFFFFFF));
 }
 
+void SidPortalProcessor::reset_firmware()
+{
+    std::lock_guard<std::mutex> g(events_mutex_);
+    if (events_.size() < 1024) events_.push_back(ResetFirmware << 24);
+}
+
 void SidPortalProcessor::send_midi(const std::vector<uint8_t>& bytes)
 {
     std::lock_guard<std::mutex> g(events_mutex_);
     midi_from_editor_.insert(midi_from_editor_.end(), bytes.begin(), bytes.end());
+}
+
+bool SidPortalProcessor::install_firmware(const juce::File& source, juce::String& error)
+{
+    if (!source.existsAsFile()) {
+        error = "The selected file could not be opened.";
+        return false;
+    }
+
+    // Check the accepted image sizes and reset vector before saving anything.
+    Board probe(48000.0, 1000000.0, false, SidEngineType::ReSid);
+    std::string load_error;
+    if (!probe.load_rom(source.getFullPathName().toStdString(), &load_error)) {
+        error = juce::String(load_error);
+        return false;
+    }
+
+    juce::MemoryBlock firmware;
+    if (!source.loadFileAsData(firmware)) {
+        error = "The selected firmware could not be read.";
+        return false;
+    }
+
+    const auto destination = data_dir().getChildFile("firmware.bin");
+    const auto directory_result = destination.getParentDirectory().createDirectory();
+    if (directory_result.failed()) {
+        error = juce::String("Could not create ") + destination.getParentDirectory().getFullPathName()
+              + ": " + directory_result.getErrorMessage();
+        return false;
+    }
+
+    // Stop a previous boot before replacing the file it might be reading.
+    ++generation_;
+    if (boot_thread_.joinable()) boot_thread_.join();
+
+    if (source.getFullPathName() != destination.getFullPathName()
+        && !destination.replaceWithData(firmware.getData(), firmware.getSize())) {
+        error = juce::String("Could not copy the firmware to ") + destination.getFullPathName();
+        return false;
+    }
+
+    rom_path_ = destination.getFullPathName();
+    {
+        std::lock_guard<std::mutex> g(problem_mutex_);
+        problem_.clear();
+    }
+
+    auto nvram = data_dir().getChildFile("nvram.bin");
+    std::vector<uint8_t> ram;
+    if (nvram.existsAsFile()) ram = read_file(nvram);
+    start_boot(std::move(ram), !nvram.existsAsFile());
+    return true;
 }
 
 void SidPortalProcessor::set_engine(SidEngineType type)

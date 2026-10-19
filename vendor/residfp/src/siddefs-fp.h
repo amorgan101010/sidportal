@@ -72,7 +72,11 @@
 #define RESIDFP_BRANCH_HINTS 1
 
 // Compiler specifics.
-#define HAVE_BUILTIN_EXPECT 1
+#if defined(_MSC_VER)
+#  define HAVE_BUILTIN_EXPECT 0
+#else
+#  define HAVE_BUILTIN_EXPECT 1
+#endif
 
 // Branch prediction macros, lifted off the Linux kernel.
 #if RESIDFP_BRANCH_HINTS && HAVE_BUILTIN_EXPECT

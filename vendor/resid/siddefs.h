@@ -29,7 +29,11 @@
 
 // Compiler specifics.
 #define HAVE_BOOL 1
+#if defined(_MSC_VER)
+#define HAVE_BUILTIN_EXPECT 0
+#else
 #define HAVE_BUILTIN_EXPECT 1
+#endif
 #define HAVE_LOG1P 1
 
 // Define bool, true, and false for C++ compilers that lack these keywords.

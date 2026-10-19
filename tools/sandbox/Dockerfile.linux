@@ -1,0 +1,12 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates unzip libasound2t64 libfreetype6 libfontconfig1 libgl1 \
+    libx11-6 libxcomposite1 libxcursor1 libxext6 libxinerama1 libxrandr2 libxrender1 \
+    python3 xvfb xauth x11-utils alsa-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY tools/sandbox/test-container.sh /usr/local/bin/sidportal-test
+ENTRYPOINT ["/bin/sh", "/usr/local/bin/sidportal-test"]

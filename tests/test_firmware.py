@@ -59,6 +59,43 @@ def peak(pcm):
     return max(abs(v) for v in pcm)
 
 
+def asid_pitch(pcm, rate=48000):
+    """Find the strongest autocorrelation period in the A4 search window."""
+    segment = pcm[-rate // 2:]
+    mean = sum(segment) / len(segment)
+    centered = [sample - mean for sample in segment]
+    best_lag, best_corr = 0, float('-inf')
+    for lag in range(rate // 500, rate // 350 + 1):
+        count = len(centered) - lag
+        left = centered[:count]
+        right = centered[lag:]
+        norm = (sum(v * v for v in left) * sum(v * v for v in right)) ** 0.5
+        corr = sum(a * b for a, b in zip(left, right)) / norm if norm else 0
+        if corr > best_corr:
+            best_lag, best_corr = lag, corr
+    return rate / best_lag if best_lag else 0
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    wav = Path(tmp) / 'asid.wav'
+    # ASID slots 0, 1, 4, 5, 21 and 22: voice 1 A4, fast attack, full sustain,
+    # saw + gate, and master volume 15. A repeated update commits the buffered writes.
+    frame = 'F0 2D 4E 33 00 00 03 21 00 00 00 56 1C 09 70 0F 21 F7'
+    lcd = 'F0 2D 4F ' + ' '.join(f'{ord(c):02X}' for c in 'ASID FRAME TEST'.ljust(32)) + ' F7'
+    lcd_updates = ';'.join(f'midi {frame}' for _ in range(16))
+    script = ('wait 12500;press down;wait 300;press down;wait 300;press enter;wait 300;'
+              f'midi {frame};wait 20;midi {frame};wait 20;midi {lcd};{lcd_updates};wait 1200;lcd')
+    out = run(script, '--fresh', '--render', str(wav))
+    check('ASID FRAME TEST' in out, 'ASID mode displays the received text', out)
+    check('crashed' not in out and 'midi in:' not in out,
+          'ASID MIDI arrives without receiver drops or overruns', out)
+    with wave.open(str(wav)) as w:
+        pcm = array.array('h', w.readframes(w.getnframes()))
+    hz = asid_pitch(pcm)
+    check(438 <= hz <= 443, 'ASID register updates play A4 at 440 Hz', f'{hz:.1f} Hz')
+    print(f'ASID measurement: {hz:.1f} Hz; 18-byte update takes 5.8 ms at 3125 bytes/s; 0 drops/overruns')
+
+
 for engine in ('residfp', 'resid'):
     e = ('--engine', engine)
     # Power-on: the DC step when the firmware first sets the volume must stay muted.

@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <thread>
+#include <vector>
 
 extern juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter();
 
@@ -19,6 +20,15 @@ void check(bool ok, const char* what, const juce::String& detail = {})
 {
     std::printf("%s %s %s\n", ok ? "ok  " : "FAIL", what, detail.toRawUTF8());
     failures += !ok;
+}
+
+void set_environment_variable(const char* name, const char* value)
+{
+#if JUCE_WINDOWS
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
 }
 
 struct Host {
@@ -95,6 +105,13 @@ struct Host {
         run(300, off);
         return rms;
     }
+
+    void sysex(const std::vector<juce::uint8>& bytes)
+    {
+        juce::MidiBuffer midi;
+        midi.addEvent(juce::MidiMessage::createSysExMessage(bytes.data(), int(bytes.size())), 0);
+        run(20, midi);
+    }
 };
 
 } // namespace
@@ -104,7 +121,9 @@ int main()
     juce::ScopedJuceInitialiser_GUI init;
     auto tmp = juce::File::createTempFile("sidportal-smoke");
     tmp.createDirectory();
-    setenv("XDG_DATA_HOME", tmp.getFullPathName().toRawUTF8(), 1);
+    auto isolated_data_dir = tmp.getChildFile("data");
+    isolated_data_dir.createDirectory();
+    set_environment_variable("SIDPORTAL_DATA_DIR", isolated_data_dir.getFullPathName().toRawUTF8());
 
     juce::MemoryBlock state;
     juce::String first_lcd;
@@ -134,6 +153,28 @@ int main()
         check(rms2 > 0.003, "still sounds on reSID / 8580", "rms " + juce::String(rms2, 4));
         h.p.chip_param()->setValueNotifyingHost(0.0f);
         h.p.set_engine(sidportal::SidEngineType::ReSidFp);
+
+        // Host SysEx reaches the same firmware SCI path as realtime ALSA MIDI.
+        h.press(3); // Exit patch play to the top menu.
+        if (!h.lcd().contains("System")) h.press(3);
+        check(h.lcd().contains("System"), "returns to the top menu before ASID", h.lcd());
+        h.press(11); // DOWN to System
+        h.press(11); // DOWN to ASID
+        h.press(15); // ENTER
+        const std::vector<juce::uint8> update = {
+            0x2D, 0x4E, 0x33, 0, 0, 0x03, 0x21, 0, 0, 0,
+            0x56, 0x1C, 0x09, 0x70, 0x0F, 0x21};
+        h.sysex(update);
+        h.sysex(update);
+        std::vector<juce::uint8> text{0x2D, 0x4F};
+        const char* label = "ASID FRAME TEST";
+        for (int i = 0; i < 32; ++i)
+            text.push_back(i < 15 ? uint8_t(label[i]) : uint8_t(' '));
+        h.sysex(text);
+        for (int i = 0; i < 16; ++i) h.sysex(update);
+        double asidRms = h.run(500);
+        check(h.lcd().contains("ASID FRAME TEST"), "host ASID SysEx reaches the firmware", h.lcd());
+        check(asidRms > 0.001, "host ASID SysEx produces SID audio", "rms " + juce::String(asidRms, 4));
     }
     {
         Host h;

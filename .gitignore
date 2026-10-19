@@ -1,6 +1,7 @@
 # Firmware, patch banks, builds and generated output never belong in this repository.
 /build/
 /build-*/
+/dist/
 /roms/
 /patches/
 __pycache__/

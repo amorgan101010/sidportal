@@ -20,6 +20,8 @@ import math
 import os
 import queue
 import re
+import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -65,7 +67,12 @@ DEFAULT_CONFIG = {
     'ext_gain': 1.0,
     'filter_bias': 0.0,
     'bias_cc': -1,
+    'noise_gate': False,
+    'gate_threshold_db': -60.0,
 }
+
+VSID_INSTALL = Path.home() / '.local' / 'opt' / 'sidportal-asid-vice'
+VSID_ROM_DIR = DATA_DIR / 'vice-roms'
 
 
 def load_config() -> dict:
@@ -95,6 +102,16 @@ def find_binary() -> Path | None:
         if p.exists():
             return p
     return None
+
+
+def find_vsid_binary() -> Path | None:
+    configured = os.environ.get('SIDPORTAL_VSID')
+    candidates = [Path(configured)] if configured else []
+    candidates += [VSID_INSTALL / 'bin' / 'vsid']
+    found = shutil.which('vsid')
+    if found:
+        candidates.append(Path(found))
+    return next((p for p in candidates if p.is_file() and os.access(p, os.X_OK)), None)
 
 
 def preset_banks() -> list[Path]:
@@ -156,6 +173,36 @@ def sidportal_input_port() -> str | None:
     return None
 
 
+def sidportal_vsid_port_index(engine_pid: int) -> int | None:
+    """Return VICE's MIDI destination index for this engine's input port."""
+    try:
+        out = subprocess.run(['aconnect', '-o'], capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    client_re = re.compile(r"client (\d+): '([^']*)'(?: \[.*?pid=(\d+)\])?")
+    port_re = re.compile(r"\s+(\d+) '([^']*)'")
+    client_id = None
+    client_name = ''
+    client_pid = None
+    index = 0
+    matches = []
+    for line in out.splitlines():
+        m = client_re.match(line)
+        if m:
+            client_id, client_name, client_pid = m.group(1), m.group(2).strip(), m.group(3)
+            continue
+        m = port_re.match(line)
+        if m and client_id not in (None, '0'):
+            port_name = m.group(2).strip()
+            if (client_name == 'SidPortal' and client_pid == str(engine_pid)
+                    and port_name.startswith('SidPortal MIDI In')):
+                matches.append(index)
+            # This is the same order used by asid-vice's ALSA destination enumeration:
+            # client ID, then port ID, with the System client excluded.
+            index += 1
+    return matches[0] if len(matches) == 1 else None
+
+
 # --- Engine -------------------------------------------------------------------------
 
 class Engine:
@@ -173,6 +220,9 @@ class Engine:
         if self.cfg.get('ext_in', 'none') not in ('', 'none'):
             args += ['--ext-in', self.cfg['ext_in']]
         args += ['--ext-gain', f"{self.cfg.get('ext_gain', 1.0):.3f}"]
+        if self.cfg.get('noise_gate', False):
+            args.append('--noise-gate')
+        args += ['--gate-threshold-db', str(self.cfg.get('gate_threshold_db', -60.0))]
         args += ['--filter-bias', f"{self.cfg.get('filter_bias', 0.0):.3f}"]
         if self.cfg.get('bias_cc', -1) >= 0:
             args += ['--bias-cc', str(self.cfg['bias_cc'])]
@@ -553,6 +603,8 @@ class App:
         self.root = root
         self.cfg = load_config()
         self.first_run = not NVRAM_PATH.exists()
+        self.vsid_proc: subprocess.Popen | None = None
+        self.asid_mode = False
         root.title('SidPortal')
         root.configure(bg='#1b1b1d')
         root.resizable(False, False)
@@ -643,6 +695,8 @@ class App:
         self.out_var = tk.StringVar(value=self.cfg['audio'])
         self.ext_var = tk.StringVar(value=self.cfg.get('ext_in', 'none'))
         self.ext_gain_var = tk.DoubleVar(value=self.cfg.get('ext_gain', 1.0))
+        self.noise_gate_var = tk.BooleanVar(value=self.cfg.get('noise_gate', False))
+        self.gate_threshold_var = tk.DoubleVar(value=self.cfg.get('gate_threshold_db', -60.0))
         self.bias_cc_var = tk.StringVar(value=self._cc_text(self.cfg.get('bias_cc', -1)))
         self.engine_var = tk.StringVar(value=ENGINE_NAMES.get(self.cfg.get('engine'), ENGINE_NAMES['residfp']))
         self.midi_sources: list[tuple[str, str]] = []
@@ -650,6 +704,13 @@ class App:
 
         # The settings menu hangs off the gear button on the panel (or a right-click on it).
         self.menu = tk.Menu(self.root, tearoff=False)
+        self.menu.add_command(label='ASID Mode', command=self.enter_asid_mode)
+        self.menu.add_command(label='Exit ASID Mode / Restart', command=self.exit_asid_mode)
+        self.menu.add_separator()
+        self.menu.add_command(label='Play SID tune…', command=self.play_sid_tune)
+        self.menu.add_command(label='Stop VSID', command=self.stop_vsid, state='disabled')
+        self.stop_vsid_menu_index = self.menu.index('end')
+        self.menu.add_separator()
         self.menu.add_command(label='Load SysEx…', command=self.load_syx)
         self.menu.add_command(label='Setup…', command=self.open_setup)
         self.menu.add_separator()
@@ -666,6 +727,173 @@ class App:
         bar.pack(fill='x')
         self.status_var = tk.StringVar(value='Starting…')
         ttk.Label(bar, textvariable=self.status_var, style='Bar.TLabel').pack(side='right', padx=4)
+
+    def enter_asid_mode(self, on_ready=None):
+        # From the top menu, DOWN twice selects ASID and ENTER starts it.
+        if self.asid_mode:
+            if on_ready:
+                on_ready()
+            return
+        if self.ready_at is None or time.monotonic() < self.ready_at + 18:
+            self.status_var.set('Waiting for SidPortal to finish starting…')
+            self.root.after(250, lambda: self.enter_asid_mode(on_ready))
+            return
+        keys = [KEY_LEGENDS.index('C'), KEY_LEGENDS.index('C'), KEY_LEGENDS.index('D')]
+
+        def press_next(index: int):
+            if index >= len(keys):
+                return
+            code = keys[index]
+            self.key(code, True)
+            # The ASID receive loop treats a still-held keypad key as its exit request.
+            # Release ENTER before that loop's first poll, while keeping the navigation
+            # keys long enough for the normal menu scanner to register them.
+            hold_ms = 60 if code == KEY_LEGENDS.index('D') else 80
+            self.root.after(hold_ms, lambda: self.key(code, False))
+            if index + 1 < len(keys):
+                self.root.after(180, lambda: press_next(index + 1))
+            else:
+                def ready():
+                    self.asid_mode = True
+                    if on_ready:
+                        on_ready()
+                self.root.after(100, ready)
+
+        press_next(0)
+
+    def play_sid_tune(self):
+        default_library = Path.home() / 'Music' / 'HVSC_85' / 'C64Music'
+        configured_library = self.cfg.get('sid_library')
+        start = Path(configured_library) if configured_library else default_library
+        if not start.is_dir():
+            start = default_library if default_library.is_dir() else Path.home() / 'Music'
+        chosen = filedialog.askopenfilename(
+            parent=self.root, title='Choose a SID tune from HVSC', initialdir=start,
+            filetypes=[('SID tunes', '*.sid *.SID'), ('All files', '*')])
+        if not chosen:
+            return
+        tune = Path(chosen)
+
+        vsid = find_vsid_binary()
+        if not vsid:
+            messagebox.showerror(
+                'VSID not found',
+                'Install the ASID-enabled VICE build or set SIDPORTAL_VSID to its vsid binary.')
+            return
+        roms = {name: VSID_ROM_DIR / filename for name, filename in {
+            'kernal': 'kernal_generic.rom', 'basic': 'basic_generic.rom',
+            'chargen': 'chargen_openroms.rom'}.items()}
+        missing = [str(path) for path in roms.values() if not path.is_file()]
+        if missing:
+            messagebox.showerror(
+                'VSID ROMs not found',
+                'The open VICE ROM set is incomplete:\n\n' + '\n'.join(missing))
+            return
+        library_root = next((p for p in (tune.parent, *tune.parents) if p.name == 'C64Music'), tune.parent)
+        self.cfg['sid_library'] = str(library_root)
+        save_config(self.cfg)
+
+        def start_player():
+            if self.ready_at is None or time.monotonic() < self.ready_at + 18:
+                self.status_var.set('Waiting for SidPortal to finish starting…')
+                self.root.after(250, start_player)
+                return
+
+            def start_after_stop():
+                if self.asid_mode:
+                    self._launch_vsid(tune, vsid, roms)
+                else:
+                    self.enter_asid_mode(lambda: self._launch_vsid(tune, vsid, roms))
+
+            self._stop_vsid_then(start_after_stop)
+
+        start_player()
+
+    def _launch_vsid(self, tune: Path, vsid: Path, roms: dict[str, Path]):
+        engine_pid = self.engine.proc.pid if self.engine.proc else -1
+        port_index = sidportal_vsid_port_index(engine_pid)
+        if port_index is None:
+            messagebox.showerror(
+                'SidPortal MIDI input not found',
+                'Could not identify this SidPortal instance in the ALSA MIDI destination list.')
+            return
+        args = [str(vsid), '-sounddev', 'asid', '-soundarg', str(port_index),
+                '-kernal', str(roms['kernal']), '-basic', str(roms['basic']),
+                '-chargen', str(roms['chargen']), str(tune)]
+        env = os.environ.copy()
+        env['HVSC_BASE'] = self.cfg.get('sid_library', str(tune.parent))
+        try:
+            proc = subprocess.Popen(args, cwd=str(tune.parent),
+                                    env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as exc:
+            messagebox.showerror('Could not start VSID', str(exc))
+            return
+        self.vsid_proc = proc
+        self.menu.entryconfigure(self.stop_vsid_menu_index, state='normal')
+        self.status_var.set(f'VSID: {tune.name}')
+        self.root.after(500, lambda: self._watch_vsid(proc))
+
+    def _watch_vsid(self, proc: subprocess.Popen):
+        if proc.poll() is None:
+            self.root.after(500, lambda: self._watch_vsid(proc))
+            return
+        if self.vsid_proc is proc:
+            self.vsid_proc = None
+            self.menu.entryconfigure(self.stop_vsid_menu_index, state='disabled')
+            self.status_var.set('Ready')
+
+    def _stop_vsid_then(self, callback=None):
+        proc = self.vsid_proc
+        if proc is None or proc.poll() is not None:
+            self.vsid_proc = None
+            self.menu.entryconfigure(self.stop_vsid_menu_index, state='disabled')
+            if callback:
+                callback()
+            return
+        self.vsid_proc = None
+        self.menu.entryconfigure(self.stop_vsid_menu_index, state='disabled')
+        self.status_var.set('Stopping VSID…')
+        try:
+            proc.send_signal(signal.SIGINT)
+        except ProcessLookupError:
+            pass
+        self._wait_vsid_stop(proc, time.monotonic() + 4, callback)
+
+    def _wait_vsid_stop(self, proc: subprocess.Popen, deadline: float, callback=None):
+        if proc.poll() is not None:
+            if callback:
+                callback()
+            elif self.root.winfo_exists():
+                self.status_var.set('Ready')
+            return
+        if time.monotonic() >= deadline:
+            proc.terminate()
+            self.root.after(500, lambda: self._force_stop_vsid(proc, callback))
+            return
+        self.root.after(100, lambda: self._wait_vsid_stop(proc, deadline, callback))
+
+    def _force_stop_vsid(self, proc: subprocess.Popen, callback=None):
+        if proc.poll() is None:
+            proc.kill()
+            self.root.after(100, lambda: self._force_stop_vsid(proc, callback))
+        elif callback:
+            callback()
+        elif self.root.winfo_exists():
+            self.status_var.set('Ready')
+
+    def stop_vsid(self):
+        self._stop_vsid_then()
+
+    def exit_asid_mode(self):
+        self._stop_vsid_then(self._restart_firmware)
+
+    def _restart_firmware(self):
+        self.asid_mode = False
+        self.ready_at = time.monotonic()
+        self.status_var.set('Restarting firmware…')
+        self.engine.send('reset')
+        self.root.after(18000, lambda: self.status_var.set('Ready')
+                        if self.root.winfo_exists() and not self.asid_mode else None)
 
     def _open_menu(self, gear):
         self.canvas.itemconfigure(gear, image=self.images['gear'][1])
@@ -743,9 +971,27 @@ class App:
         field('Ext in (through the filter)', ext_box)
         field('Ext in gain', ttk.Scale(f, from_=0.0, to=4.0, variable=self.ext_gain_var,
                                        command=lambda v: self._ext_gain_changed()))
+        field('Host noise gate', ttk.Checkbutton(f, text='On', variable=self.noise_gate_var,
+                                                command=self._gate_changed))
+        gate_scale = ttk.Scale(f, from_=-90.0, to=-18.0, variable=self.gate_threshold_var,
+                               command=lambda v: self._gate_changed())
+        gate_value = ttk.Label(f, text=f"{self.gate_threshold_var.get():.1f} dBFS")
+        self.gate_value = gate_value
+        field('Gate threshold (-90 to -18 dBFS)', gate_scale, gate_value)
 
         ttk.Button(f, text='Close', command=w.destroy).grid(row=row, column=0, columnspan=3, sticky='e', pady=(12, 0))
         f.columnconfigure(1, weight=1)
+
+    def _gate_changed(self):
+        enabled = self.noise_gate_var.get()
+        threshold = round(max(-90.0, min(-18.0, self.gate_threshold_var.get())), 1)
+        self.cfg['noise_gate'] = enabled
+        self.cfg['gate_threshold_db'] = threshold
+        save_config(self.cfg)
+        if hasattr(self, 'gate_value') and self.gate_value.winfo_exists():
+            self.gate_value.configure(text=f'{threshold:.1f} dBFS')
+        self.engine.send(f'gatethreshold {threshold:.1f}')
+        self.engine.send(f'noisegate {int(enabled)}')
 
     def _bias_cc_changed(self):
         text = self.bias_cc_var.get().strip()
@@ -888,6 +1134,14 @@ class App:
             return
         if not down and code not in self.keys_down:
             return
+        if down and self.asid_mode:
+            self.keys_down.add(code)
+            self.canvas.itemconfigure(self.key_items[code], image=self.images[f'key{code}'][1])
+            # Route the panel exit through the host reset path instead of relying on
+            # the firmware's keypad poll and its timing while ASID data is arriving.
+            self.asid_mode = False
+            self._stop_vsid_then(self._restart_firmware)
+            return
         (self.keys_down.add if down else self.keys_down.discard)(code)
         up_img, down_img = self.images[f'key{code}']
         self.canvas.itemconfigure(self.key_items[code], image=down_img if down else up_img)
@@ -1011,6 +1265,21 @@ class App:
             save_config(self.cfg)
         except OSError:
             pass
+        proc = self.vsid_proc
+        self.vsid_proc = None
+        if proc and proc.poll() is None:
+            try:
+                proc.send_signal(signal.SIGINT)
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=1)
+            except ProcessLookupError:
+                pass
         self.engine.stop()
         self.root.destroy()
 

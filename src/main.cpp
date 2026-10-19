@@ -1,6 +1,7 @@
 // SidPortal host: headless scripting, WAV rendering, and the realtime
 // ALSA engine driven by the Tk panel over stdin/stdout.
 #include "board.h"
+#include "noise_gate.h"
 
 #include <alsa/asoundlib.h>
 
@@ -42,6 +43,8 @@ struct Options {
     bool log_io = false;
     bool trace_sid = false;
     float volume = 1.0f;
+    bool noise_gate = false;
+    float gate_threshold_db = -60.0f;
     int period = 256;
     std::string ext_in;   // ALSA capture device for Ext In (empty: none)
     float ext_gain = 1.0f;
@@ -72,6 +75,8 @@ void usage()
         "  --log-io            log accesses to unmapped I/O\n"
         "  --trace-sid         print SID register writes\n"
         "  --volume F          realtime output gain (default 1.0)\n"
+        "  --noise-gate        enable host output noise gate (default off)\n"
+        "  --gate-threshold-db DB  gate threshold, -90..-18 dBFS (default -60)\n"
         "commands: wait MS | lcd | press KEY | down KEY | up KEY | enc N | knob I V |\n"
         "          midi HEX.. | note N VEL MS | syx FILE | extin FILE.wav | extgain F |\n"
         "          filterbias V | model 6581|8580 | engine resid|residfp |\n"
@@ -167,6 +172,7 @@ struct Headless {
     Board& board;
     const Options& opt;
     std::vector<int16_t> pcm;
+    NoiseGate gate;
 
     void advance_ms(double ms)
     {
@@ -178,6 +184,7 @@ struct Headless {
         size_t at = pcm.size();
         pcm.resize(at + size_t(frames));
         board.render(pcm.data() + at, frames);
+        if (gate.enabled()) for (int i = 0; i < frames; ++i) pcm[at + size_t(i)] = gate.process(pcm[at + size_t(i)]);
     }
 
     bool command(const std::string& line)
@@ -253,7 +260,10 @@ struct Headless {
 
 int run_headless(Board& board, const Options& opt)
 {
-    Headless h{board, opt, {}};
+    Headless h{board, opt, {}, {}};
+    h.gate.set_sample_rate(opt.sample_rate);
+    h.gate.set_threshold_db(opt.gate_threshold_db);
+    h.gate.set_enabled(opt.noise_gate);
     std::string script = opt.script;
     size_t pos = 0;
     while (pos <= script.size()) {
@@ -305,8 +315,13 @@ int main(int argc, char** argv)
         else if (a == "--log-io") opt.log_io = true;
         else if (a == "--trace-sid") opt.trace_sid = true;
         else if (a == "--volume") opt.volume = std::stof(next());
+        else if (a == "--noise-gate") opt.noise_gate = true;
+        else if (a == "--gate-threshold-db") opt.gate_threshold_db = std::stof(next());
         else if (a == "--help" || a == "-h") { usage(); return 0; }
         else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); usage(); return 2; }
+    }
+    if (!std::isfinite(opt.gate_threshold_db) || opt.gate_threshold_db < -90 || opt.gate_threshold_db > -18) {
+        std::fprintf(stderr, "gate threshold must be -90..-18 dBFS\n"); return 2;
     }
     if (opt.rom.empty()) { usage(); return 2; }
 
@@ -352,6 +367,7 @@ struct Realtime {
     std::mutex midi_out_lock;
     std::vector<uint8_t> midi_out;
     float volume = 1.0f;
+    NoiseGate gate;
     snd_seq_t* seq = nullptr;
     int in_port = -1, out_port = -1;
     std::thread capture;
@@ -417,6 +433,7 @@ struct Realtime {
                     midi_out.insert(midi_out.end(), out.begin(), out.end());
                 }
                 vol = volume;
+                if (gate.enabled()) for (auto& sample : mono) sample = gate.process(sample);
             }
             for (int i = 0; i < opt.period; ++i) {
                 // Fade in over the first half second: reSID's output settles from a DC step.
@@ -636,6 +653,8 @@ struct Realtime {
             for (uint8_t b : data) board.midi_in(b);
         }
         else if (cmd == "volume") { float v = 1; in >> v; volume = std::clamp(v, 0.0f, 4.0f); }
+        else if (cmd == "noisegate") { int on = 0; in >> on; gate.set_enabled(on != 0); }
+        else if (cmd == "gatethreshold") { float db = -60; in >> db; if (std::isfinite(db)) gate.set_threshold_db(db); }
         else if (cmd == "model") { std::string m; in >> m; board.set_sid_model(m == "8580"); }
         else if (cmd == "save") { if (!opt.nvram.empty()) board.save_nvram(opt.nvram); }
         else if (cmd == "reset") board.reset();
@@ -656,7 +675,11 @@ int run_realtime(Board& board, const Options& opt)
 {
     std::signal(SIGINT, on_signal);
     std::signal(SIGTERM, on_signal);
-    Realtime rt{board, opt, {}, {}, {}, {}, opt.volume, nullptr, -1, -1, {}, {false}, {-1}, {false}};
+    Realtime rt{board, opt, {}, {}, {}, {}, opt.volume, {}, nullptr, -1, -1, {}, {false}, {-1}, {false}};
+    rt.volume = opt.volume;
+    rt.gate.set_sample_rate(opt.sample_rate);
+    rt.gate.set_threshold_db(opt.gate_threshold_db);
+    rt.gate.set_enabled(opt.noise_gate);
     if (opt.midi == "seq" && !rt.open_seq()) {
         rt.emit("error cannot open the ALSA sequencer");
         return 1;

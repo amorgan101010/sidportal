@@ -1,0 +1,72 @@
+name: Windows build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Fetch JUCE 8
+        shell: pwsh
+        run: git clone --depth 1 --branch 8.0.16-security https://github.com/juce-framework/JUCE.git "$env:RUNNER_TEMP\JUCE"
+
+      - name: Configure Windows x64 standalone and VST3
+        run: >-
+          cmake -S . -B build-windows -G "Visual Studio 17 2022" -A x64
+          -DJUCE_DIR="$env:RUNNER_TEMP/JUCE"
+          -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+          -DSIDPORTAL_CLI=OFF
+
+      - name: Build
+        run: cmake --build build-windows --config Release --parallel 3
+
+      - name: Run available checks
+        run: ctest --test-dir build-windows --build-config Release --output-on-failure
+
+      - name: Package Windows apps
+        run: python tools/package_juce_platform.py windows build-windows dist
+
+      - name: Stage VST3 sandbox host
+        run: |
+          New-Item -ItemType Directory -Force sandbox-tests | Out-Null
+          Copy-Item build-windows/sidportal_vst3_hostcheck_artefacts/Release/sidportal_vst3_hostcheck.exe sandbox-tests/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SidPortal-Windows-x64
+          path: |
+            dist/SidPortal-Windows-x64.zip
+            dist/SidPortal-Windows-x64.zip.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SidPortal-Windows-sandbox
+          path: sandbox-tests/sidportal_vst3_hostcheck.exe
+
+      - name: Attach package to GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if (-not (gh release view $env:GITHUB_REF_NAME 2>$null)) {
+            gh release create $env:GITHUB_REF_NAME --verify-tag --generate-notes
+            if ($LASTEXITCODE -ne 0 -and -not (gh release view $env:GITHUB_REF_NAME 2>$null)) { exit $LASTEXITCODE }
+          }
+          gh release upload $env:GITHUB_REF_NAME `
+            dist/SidPortal-Windows-x64.zip `
+            dist/SidPortal-Windows-x64.zip.sha256 `
+            --clobber
