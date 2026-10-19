@@ -31,7 +31,15 @@ private:
     bool character_visible() const;
     void paint_lcd(juce::Graphics& g);
     void paint_knob(juce::Graphics& g, const KnobSpot& k);
+    void paint_piano(juce::Graphics& g);
+    int piano_key_at(juce::Point<float> p) const;
+    void set_piano_note(int note);
+    void release_piano_note();
+    void enter_asid_mode();
+    void exit_asid_mode();
     void open_menu();
+    void open_settings();
+    void select_firmware();
     void load_sysex();
 
     SidPortalProcessor& proc_;
@@ -50,7 +58,14 @@ private:
     bool drag_encoder_ = false;
     float enc_last_ = 0, enc_acc_ = 0, enc_angle_ = -90;
     int held_key_ = -1;
+    int piano_octave_ = 4;
+    int piano_note_ = -1;
+    int asid_step_ = -1;
+    int asid_held_key_ = -1;
+    uint32_t asid_step_at_ = 0, asid_release_at_ = 0;
+    bool asid_mode_ = false;
     bool gear_down_now_ = false;
+    bool firmware_prompt_attempted_ = false;
     std::unique_ptr<juce::FileChooser> chooser_;
 };
 

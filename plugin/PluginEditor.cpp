@@ -10,6 +10,14 @@ namespace {
 
 const juce::Colour kLcdBg(0xffa3bd3c), kLcdOff(0xff9db73a), kLcdOn(0xff1c2410), kLcdHot(0xffb4cc4e);
 constexpr uint8_t kLedBits[4] = {0x40, 0x20, 0x10, 0x08};   // Sync, MIDI, Edit, Ext clk (active low)
+constexpr float kPianoHeight = 86.0f;
+constexpr float kPianoTop = 680.0f;
+constexpr float kPianoLeft = 120.0f;
+constexpr float kPianoRight = 880.0f;
+constexpr int kWhiteSemitones[7] = {0, 2, 4, 5, 7, 9, 11};
+constexpr int kBlackSemitone[5] = {1, 3, 6, 8, 10};
+constexpr int kBlackAfterWhite[5] = {0, 1, 3, 4, 5};
+constexpr int kAsidKeyCodes[3] = {11, 11, 15};   // keypad C, C, ENTER
 
 juce::Image asset(const char* name)
 {
@@ -46,6 +54,49 @@ juce::Rectangle<float> box(const juce::var& v)
     return juce::Rectangle<float>::leftTopRightBottom(num(v[0]), num(v[1]), num(v[2]), num(v[3]));
 }
 
+class NoiseGateSettings final : public juce::Component {
+public:
+    explicit NoiseGateSettings(SidPortalProcessor& processor)
+    {
+        addAndMakeVisible(enabled_);
+        enabled_.setButtonText("Host noise gate");
+
+        threshold_label_.setText("Threshold", juce::dontSendNotification);
+        threshold_label_.setJustificationType(juce::Justification::centredRight);
+        addAndMakeVisible(threshold_label_);
+
+        threshold_.setSliderStyle(juce::Slider::LinearHorizontal);
+        threshold_.setTextBoxStyle(juce::Slider::TextBoxRight, false, 84, 24);
+        threshold_.setTextValueSuffix(" dBFS");
+        addAndMakeVisible(threshold_);
+
+        enabled_attachment_ = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment>(
+            processor.params, "noiseGate", enabled_);
+        threshold_attachment_ = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment>(
+            processor.params, "gateThresholdDb", threshold_);
+        setSize(440, 112);
+    }
+
+    void paint(juce::Graphics& g) override
+    {
+        g.fillAll(juce::Colour(0xff292929));
+    }
+
+    void resized() override
+    {
+        enabled_.setBounds(20, 16, getWidth() - 40, 28);
+        threshold_label_.setBounds(16, 60, 105, 30);
+        threshold_.setBounds(130, 60, getWidth() - 150, 30);
+    }
+
+private:
+    juce::ToggleButton enabled_;
+    juce::Label threshold_label_;
+    juce::Slider threshold_;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> enabled_attachment_;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> threshold_attachment_;
+};
+
 } // namespace
 
 PanelView::PanelView(SidPortalProcessor& p) : proc_(p), layout_(load_layout())
@@ -73,11 +124,15 @@ PanelView::PanelView(SidPortalProcessor& p) : proc_(p), layout_(load_layout())
         knobs_.push_back({p.knob_param(i), pt(L["knobs"][i]), num(L["knob_r"]), &knob_});
     knobs_.push_back({p.volume_param(), pt(L["volume"]), num(L["small_knob_r"]), &small_knob_});
     knobs_.push_back({p.character_param(), pt(L["character"]), num(L["small_knob_r"]), &small_knob_});
-    setSize(int(L["width"]), int(L["height"]));
+    setSize(int(L["width"]), int(L["height"]) + int(kPianoHeight));
     startTimerHz(30);
 }
 
-PanelView::~PanelView() { stopTimer(); }
+PanelView::~PanelView()
+{
+    stopTimer();
+    if (asid_held_key_ >= 0) proc_.key(asid_held_key_, false);
+}
 
 bool PanelView::character_visible() const
 {
@@ -87,8 +142,29 @@ bool PanelView::character_visible() const
 
 void PanelView::timerCallback()
 {
+    if (!firmware_prompt_attempted_ && proc_.needs_firmware()) {
+        select_firmware();
+    }
     if (++blink_ticks_ >= 12) { blink_ticks_ = 0; blink_phase_ = !blink_phase_; }
     snap_ = proc_.snapshot();
+    const uint32_t now = juce::Time::getMillisecondCounter();
+    const auto deadlineReached = [now](uint32_t deadline) { return int32_t(now - deadline) >= 0; };
+    if (asid_held_key_ >= 0 && deadlineReached(asid_release_at_)) {
+        proc_.key(asid_held_key_, false);
+        asid_held_key_ = -1;
+    }
+    if (asid_step_ >= 0 && deadlineReached(asid_step_at_) && asid_held_key_ < 0) {
+        if (asid_step_ == 3) {
+            asid_step_ = -1;
+            asid_mode_ = true;
+        } else {
+            const int code = kAsidKeyCodes[asid_step_++];
+            proc_.key(code, true);
+            asid_held_key_ = code;
+            asid_release_at_ = now + (code == 15 ? 60u : 80u);
+            asid_step_at_ = now + 180u;
+        }
+    }
     repaint();
 }
 
@@ -114,7 +190,7 @@ void PanelView::paint_lcd(juce::Graphics& g)
         // Not up yet (or no firmware): say so on the display itself.
         auto problem = proc_.problem();
         juce::String l1 = problem.isEmpty() ? "  Starting up..." : "No firmware";
-        juce::String l2 = problem.isEmpty() ? "" : "tools/roms.py";
+        juce::String l2 = problem.isEmpty() ? "" : "Choose firmware";
         std::memset(chars, ' ', 32);
         for (int i = 0; i < 16 && i < l1.length(); ++i) chars[i] = uint8_t(l1[i]);
         for (int i = 0; i < 16 && i < l2.length(); ++i) chars[16 + i] = uint8_t(l2[i]);
@@ -206,6 +282,93 @@ void PanelView::paint(juce::Graphics& g)
     auto gc = pt(L["gear"]);
     auto& gear = gear_down_now_ ? gear_down_ : gear_up_;
     draw_centred(g, gear, gc);
+
+    paint_piano(g);
+}
+
+void PanelView::paint_piano(juce::Graphics& g)
+{
+    const float kw = (kPianoRight - kPianoLeft) / 21.0f;
+    g.setColour(juce::Colour(0xff1b1b1d));
+    g.fillRect(0.0f, kPianoTop, float(getWidth()), kPianoHeight);
+
+    g.setColour(juce::Colour(0xff9a9aa0));
+    g.setFont(juce::FontOptions(8.0f, juce::Font::bold));
+    g.drawText("OCTAVE", 24, 714, 72, 14, juce::Justification::centred);
+    g.setColour(juce::Colour(0xffe6e6e6));
+    g.setFont(juce::FontOptions(10.0f, juce::Font::bold));
+    g.drawText("C" + juce::String(piano_octave_ - 1), 36, 731, 48, 16,
+               juce::Justification::centred);
+    // Draw the octave controls as simple triangles so they work with any system font.
+    juce::Path leftArrow;
+    leftArrow.startNewSubPath(30.0f, 739.0f);
+    leftArrow.lineTo(38.0f, 733.0f);
+    leftArrow.lineTo(38.0f, 745.0f);
+    leftArrow.closeSubPath();
+    g.fillPath(leftArrow);
+    juce::Path rightArrow;
+    rightArrow.startNewSubPath(90.0f, 739.0f);
+    rightArrow.lineTo(82.0f, 733.0f);
+    rightArrow.lineTo(82.0f, 745.0f);
+    rightArrow.closeSubPath();
+    g.fillPath(rightArrow);
+
+    for (int octave = 0; octave < 3; ++octave) {
+        for (int i = 0; i < 7; ++i) {
+            const float x = kPianoLeft + (octave * 7 + i) * kw;
+            const int note = piano_octave_ * 12 + octave * 12 + kWhiteSemitones[i];
+            g.setColour(note == piano_note_ ? juce::Colour(0xffe0a43a) : juce::Colour(0xfff4f2ec));
+            g.fillRect(x, kPianoTop + 8.0f, kw - 1.0f, 72.0f);
+            g.setColour(juce::Colour(0xff555555));
+            g.drawRect(x, kPianoTop + 8.0f, kw - 1.0f, 72.0f, 1.0f);
+        }
+    }
+
+    for (int octave = 0; octave < 3; ++octave) {
+        for (int i = 0; i < 5; ++i) {
+            const float x = kPianoLeft + (octave * 7 + kBlackAfterWhite[i] + 1) * kw - kw * 0.3f;
+            const int note = piano_octave_ * 12 + octave * 12 + kBlackSemitone[i];
+            g.setColour(note == piano_note_ ? juce::Colour(0xffe0a43a) : juce::Colour(0xff151515));
+            g.fillRect(x, kPianoTop + 8.0f, kw * 0.6f, 46.0f);
+            g.setColour(juce::Colour(0xff000000));
+            g.drawRect(x, kPianoTop + 8.0f, kw * 0.6f, 46.0f, 1.0f);
+        }
+    }
+}
+
+int PanelView::piano_key_at(juce::Point<float> p) const
+{
+    if (p.y < kPianoTop + 8.0f || p.y > kPianoTop + 80.0f || p.x < kPianoLeft || p.x >= kPianoRight)
+        return -1;
+
+    const float kw = (kPianoRight - kPianoLeft) / 21.0f;
+    // Black keys sit above the white keys and therefore take hit priority.
+    if (p.y <= kPianoTop + 54.0f) {
+        for (int octave = 0; octave < 3; ++octave)
+            for (int i = 0; i < 5; ++i) {
+                const float x = kPianoLeft + (octave * 7 + kBlackAfterWhite[i] + 1) * kw - kw * 0.3f;
+                if (juce::Rectangle<float>(x, kPianoTop + 8.0f, kw * 0.6f, 46.0f).contains(p))
+                    return juce::jlimit(0, 127, piano_octave_ * 12 + octave * 12 + kBlackSemitone[i]);
+            }
+    }
+    const int key = juce::jlimit(0, 20, int((p.x - kPianoLeft) / kw));
+    return juce::jlimit(0, 127, piano_octave_ * 12 + (key / 7) * 12 + kWhiteSemitones[key % 7]);
+}
+
+void PanelView::set_piano_note(int note)
+{
+    if (note == piano_note_) return;
+    release_piano_note();
+    if (note < 0) return;
+    piano_note_ = note;
+    proc_.send_midi({0x90, uint8_t(note), 64});  // keyboard channel 1, velocity 64
+}
+
+void PanelView::release_piano_note()
+{
+    if (piano_note_ < 0) return;
+    proc_.send_midi({0x80, uint8_t(piano_note_), 0});
+    piano_note_ = -1;
 }
 
 // --- Mouse ----------------------------------------------------------------------------
@@ -234,8 +397,23 @@ void PanelView::mouseDown(const juce::MouseEvent& e)
 {
     const auto p = e.position;
     const auto& L = layout_;
+    if (p.y >= kPianoTop) {
+        if (p.y >= 727.0f && p.y <= 750.0f && p.x >= 22.0f && p.x <= 98.0f) {
+            if (p.x < 50.0f) piano_octave_ = juce::jmax(0, piano_octave_ - 1);
+            else if (p.x > 72.0f) piano_octave_ = juce::jmin(7, piano_octave_ + 1);
+            repaint();
+            return;
+        }
+        set_piano_note(piano_key_at(p));
+        repaint();
+        return;
+    }
     if (p.getDistanceFrom(pt(L["gear"])) <= 15) { open_menu(); return; }
     if (int code = key_at(p); code >= 0) {
+        if (asid_mode_ || asid_step_ >= 0) {
+            exit_asid_mode();
+            return;
+        }
         held_key_ = code;
         proc_.key(code, true);
         repaint();
@@ -273,7 +451,10 @@ void PanelView::mouseDown(const juce::MouseEvent& e)
 
 void PanelView::mouseDrag(const juce::MouseEvent& e)
 {
-    if (drag_knob_ >= 0) {
+    if (piano_note_ >= 0 || e.mouseDownPosition.y >= kPianoTop) {
+        set_piano_note(e.position.y >= kPianoTop ? piano_key_at(e.position) : -1);
+        repaint();
+    } else if (drag_knob_ >= 0) {
         const float scale = e.mods.isShiftDown() ? 0.25f : 1.0f;   // Shift: fine
         const float v = juce::jlimit(0.0f, 1.0f, drag_start_v_ + (drag_start_y_ - e.position.y) * scale / 255.0f);
         knobs_[size_t(drag_knob_)].param->setValueNotifyingHost(v);
@@ -296,6 +477,7 @@ void PanelView::mouseDrag(const juce::MouseEvent& e)
 
 void PanelView::mouseUp(const juce::MouseEvent&)
 {
+    release_piano_note();
     if (held_key_ >= 0) { proc_.key(held_key_, false); held_key_ = -1; repaint(); }
     if (drag_knob_ >= 0) { knobs_[size_t(drag_knob_)].param->endChangeGesture(); drag_knob_ = -1; }
     drag_encoder_ = false;
@@ -338,7 +520,14 @@ void PanelView::open_menu()
     engines.addItem(10, "reSIDfp (detailed filter model)", true, fp);
     engines.addItem(11, "reSID (classic)", true, !fp);
     juce::PopupMenu menu;
+    menu.addItem(5, "Select Firmware...", proc_.needs_firmware() || proc_.problem().isNotEmpty());
+    menu.addSeparator();
     menu.addItem(1, "Load SysEx...");
+    menu.addItem(2, "Enter ASID Mode", snap_.ready && !asid_mode_ && asid_step_ < 0);
+    menu.addItem(3, "Exit ASID Mode / Restart", asid_mode_ || asid_step_ >= 0);
+    menu.addSeparator();
+    menu.addItem(4, "Noise Gate...");
+    menu.addSeparator();
     menu.addSubMenu("SID emulation", engines);
     auto gc = pt(layout_["gear"]);
     auto area = localAreaToGlobal(juce::Rectangle<int>(int(gc.x) - 14, int(gc.y) - 14, 28, 28));
@@ -347,9 +536,69 @@ void PanelView::open_menu()
         if (!self) return;
         self->gear_down_now_ = false;
         self->repaint();
-        if (id == 1) self->load_sysex();
+        if (id == 5) self->select_firmware();
+        else if (id == 1) self->load_sysex();
+        else if (id == 2) self->enter_asid_mode();
+        else if (id == 3) self->exit_asid_mode();
+        else if (id == 4) self->open_settings();
         else if (id == 10) self->proc_.set_engine(sidportal::SidEngineType::ReSidFp);
         else if (id == 11) self->proc_.set_engine(sidportal::SidEngineType::ReSid);
+    });
+}
+
+void PanelView::open_settings()
+{
+    juce::DialogWindow::LaunchOptions options;
+    options.dialogTitle = "Noise Gate";
+    options.dialogBackgroundColour = juce::Colour(0xff292929);
+    options.content.setOwned(new NoiseGateSettings(proc_));
+    options.componentToCentreAround = this;
+    options.resizable = false;
+    options.launchAsync();
+}
+
+void PanelView::enter_asid_mode()
+{
+    if (!snap_.ready || asid_mode_ || asid_step_ >= 0) return;
+    asid_step_ = 0;
+    asid_step_at_ = juce::Time::getMillisecondCounter();
+}
+
+void PanelView::exit_asid_mode()
+{
+    if (asid_held_key_ >= 0) {
+        proc_.key(asid_held_key_, false);
+        asid_held_key_ = -1;
+    }
+    asid_step_ = -1;
+    asid_mode_ = false;
+    proc_.reset_firmware();
+    repaint();
+}
+
+void PanelView::select_firmware()
+{
+    firmware_prompt_attempted_ = true;
+    chooser_ = std::make_unique<juce::FileChooser>(
+        "Select SidStation OS r34 firmware",
+        juce::File::getSpecialLocation(juce::File::userHomeDirectory), "*.bin;*.rom");
+    juce::Component::SafePointer<PanelView> self(this);
+    chooser_->launchAsync(juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+                          [self](const juce::FileChooser& fc) {
+        if (!self) return;
+        auto file = fc.getResult();
+        if (!file.existsAsFile()) return;
+
+        juce::String error;
+        if (self->proc_.install_firmware(file, error)) return;
+
+        auto options = juce::MessageBoxOptions()
+                           .withIconType(juce::MessageBoxIconType::WarningIcon)
+                           .withTitle("Firmware not installed")
+                           .withMessage(error)
+                           .withButton("OK")
+                           .withAssociatedComponent(self);
+        juce::AlertWindow::showAsync(options, [](int) {});
     });
 }
 
@@ -390,7 +639,8 @@ SidPortalEditor::SidPortalEditor(SidPortalProcessor& p) : AudioProcessorEditor(p
     const int w = view_.getWidth(), h = view_.getHeight();
     setResizable(true, true);
     setResizeLimits(w / 2, h / 2, w * 2, h * 2);
-    if (auto* c = getConstrainer()) c->setFixedAspectRatio(double(w) / double(h));
+    if (auto* constrainer = getConstrainer())
+        constrainer->setFixedAspectRatio(double(w) / double(h));
     setSize(w, h);
 }
 

@@ -1,0 +1,12 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates unzip wine64 libwine xvfb xauth x11-utils \
+    && ln -s /usr/lib/wine/wine64 /usr/local/bin/wine64 \
+    && ln -s /usr/lib/wine/wineserver64 /usr/local/bin/wineserver \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY tools/sandbox/test-container.sh /usr/local/bin/sidportal-test
+ENTRYPOINT ["/bin/sh", "/usr/local/bin/sidportal-test"]

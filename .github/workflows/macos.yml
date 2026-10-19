@@ -1,0 +1,58 @@
+name: macOS build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch JUCE 8
+        run: git clone --depth 1 --branch 8.0.16-security https://github.com/juce-framework/JUCE.git "$RUNNER_TEMP/JUCE"
+
+      - name: Configure universal VST3 and standalone
+        run: >-
+          cmake -S . -B build-macos
+          -DCMAKE_BUILD_TYPE=Release
+          -DJUCE_DIR="$RUNNER_TEMP/JUCE"
+          -DSIDPORTAL_CLI=OFF
+          -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64"
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+
+      - name: Build
+        run: cmake --build build-macos --config Release --parallel 3
+
+      - name: Run available checks
+        run: ctest --test-dir build-macos --build-config Release --output-on-failure
+
+      - name: Package apps
+        run: sh tools/package_macos.sh build-macos dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SidPortal-macOS-universal
+          path: |
+            dist/SidPortal-macOS-universal.zip
+            dist/SidPortal-macOS-universal.zip.sha256
+
+      - name: Attach package to GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes || gh release view "$GITHUB_REF_NAME" >/dev/null
+          fi
+          gh release upload "$GITHUB_REF_NAME" \
+            dist/SidPortal-macOS-universal.zip \
+            dist/SidPortal-macOS-universal.zip.sha256 \
+            --clobber

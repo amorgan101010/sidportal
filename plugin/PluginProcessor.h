@@ -9,6 +9,7 @@
 // queue and reads a panel snapshot written at the end of each block.
 #pragma once
 #include "board.h"
+#include "noise_gate.h"
 
 #include <juce_audio_processors/juce_audio_processors.h>
 
@@ -58,9 +59,12 @@ public:
     // Editor side (message thread).
     void key(int code, bool down);
     void encoder(int steps);
+    void reset_firmware();
     void send_midi(const std::vector<uint8_t>& bytes);
     void set_engine(sidportal::SidEngineType type);
     sidportal::SidEngineType engine() const { return sidportal::SidEngineType(engine_.load()); }
+    bool needs_firmware() const { return rom_path_.isEmpty(); }
+    bool install_firmware(const juce::File& source, juce::String& error);
     PanelSnapshot snapshot();
     juce::String problem() const;   // why there is no sound (no firmware), or empty
 
@@ -69,6 +73,8 @@ public:
     juce::RangedAudioParameter* volume_param() { return volume_; }
     juce::RangedAudioParameter* character_param() { return character_; }
     juce::RangedAudioParameter* chip_param() { return chip_; }
+    juce::RangedAudioParameter* gate_param() { return gate_enabled_; }
+    juce::RangedAudioParameter* gate_threshold_param() { return gate_threshold_; }
 
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout layout();
@@ -102,6 +108,9 @@ private:
     juce::RangedAudioParameter* volume_ = nullptr;
     juce::RangedAudioParameter* character_ = nullptr;
     juce::RangedAudioParameter* chip_ = nullptr;
+    juce::RangedAudioParameter* gate_enabled_ = nullptr;
+    juce::RangedAudioParameter* gate_threshold_ = nullptr;
+    sidportal::NoiseGate noise_gate_;
     int applied_knobs_[4] = {-1, -1, -1, -1};
     float applied_character_ = -9.0f;
     int applied_chip_ = -1;
